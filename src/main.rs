@@ -9,8 +9,9 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use powerbench::acquire::{record, Progress, RecordConfig};
 use powerbench::compare::{compare, CompareConfig, CompareResult};
+use powerbench::device::Device;
 use powerbench::format::Recording;
-use powerbench::plot::{plot, PlotConfig};
+use powerbench::plot::{plot, PlotConfig, Scale};
 use powerbench::stats::Stats;
 use ppk2::types::MeasurementMode;
 
@@ -66,6 +67,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Turn device-under-test power on or off without sampling. The state is
+    /// left as-is when the command exits.
+    Power {
+        #[command(subcommand)]
+        state: PowerCmd,
+    },
     /// Print statistics of one or more sample files.
     Stats {
         /// Sample files.
@@ -104,26 +111,52 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Render one or two sample files to an image using gnuplot.
+    /// Render one or two sample files with gnuplot, to an image file or an
+    /// interactive window.
     Plot {
         /// One or two sample files.
         #[arg(required = true, num_args = 1..=2)]
         files: Vec<PathBuf>,
-        /// Output image; .svg renders as SVG, anything else as PNG.
+        /// Output image; .svg renders as SVG, anything else as PNG. When
+        /// omitted, the plot is shown in an interactive window instead.
         #[arg(short, long)]
-        output: PathBuf,
+        output: Option<PathBuf>,
         /// Plot title; defaults to the file names.
         #[arg(short, long, default_value = "")]
         title: String,
         /// Number of time buckets for the min/mean/max envelope.
         #[arg(long, default_value_t = 1500)]
         buckets: usize,
-        /// Logarithmic current axis.
-        #[arg(long)]
+        /// Force a logarithmic current axis. By default the axis switches to
+        /// log automatically when the data spans a wide dynamic range, so a
+        /// low sleep floor stays readable next to wake spikes.
+        #[arg(long, conflicts_with = "linear")]
         log: bool,
+        /// Force a linear current axis.
+        #[arg(long)]
+        linear: bool,
         /// Keep the generated gnuplot script and data files.
         #[arg(long)]
         keep_data: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum PowerCmd {
+    /// Power the device under test at the given voltage and leave it on.
+    On {
+        /// Source voltage in millivolt (800..=5000).
+        #[arg(short, long)]
+        voltage: u16,
+        /// Serial port of the PPK2; autodetected when omitted.
+        #[arg(short, long)]
+        port: Option<String>,
+    },
+    /// Turn power to the device under test off.
+    Off {
+        /// Serial port of the PPK2; autodetected when omitted.
+        #[arg(short, long)]
+        port: Option<String>,
     },
 }
 
@@ -226,6 +259,25 @@ fn run() -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
 
+        Cmd::Power { state } => {
+            match state {
+                PowerCmd::On { voltage, port } => {
+                    let mut dev = Device::open(port.as_deref(), MeasurementMode::Source)?;
+                    // Leave the DUT powered when the handle drops on exit.
+                    dev.keep_power_on_drop(true);
+                    dev.set_source_voltage(voltage)?;
+                    dev.set_device_power(true)?;
+                    eprintln!("device power on at {voltage} mV; leaving it on");
+                }
+                PowerCmd::Off { port } => {
+                    let mut dev = Device::open(port.as_deref(), MeasurementMode::Source)?;
+                    dev.set_device_power(false)?;
+                    eprintln!("device power off");
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
         Cmd::Stats { files, json } => {
             for file in &files {
                 let recording =
@@ -287,6 +339,7 @@ fn run() -> anyhow::Result<ExitCode> {
             title,
             buckets,
             log,
+            linear,
             keep_data,
         } => {
             let recordings: Vec<(String, Recording)> = files
@@ -309,11 +362,17 @@ fn run() -> anyhow::Result<ExitCode> {
             let config = PlotConfig {
                 title,
                 buckets,
-                log_scale: log,
+                scale: match (log, linear) {
+                    (true, _) => Scale::Log,
+                    (_, true) => Scale::Linear,
+                    _ => Scale::Auto,
+                },
                 keep_data,
             };
-            plot(&refs, &output, &config)?;
-            eprintln!("wrote {}", output.display());
+            plot(&refs, output.as_deref(), &config)?;
+            if let Some(output) = &output {
+                eprintln!("wrote {}", output.display());
+            }
             Ok(ExitCode::SUCCESS)
         }
     }

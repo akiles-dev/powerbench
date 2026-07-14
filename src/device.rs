@@ -47,10 +47,28 @@ impl Device {
         // stick to the value the official app uses. Hardware flow control
         // must stay off: it lets the tty layer throttle the 400 KB/s stream
         // regardless of how fast we read.
-        let mut port = serialport::new(path, 115_200)
+        let builder = serialport::new(&path, 115_200)
             .timeout(Duration::from_millis(500))
-            .flow_control(FlowControl::None)
-            .open()?;
+            .flow_control(FlowControl::None);
+
+        // Keep DTR asserted after the port closes: ttys default to HUPCL
+        // (drop modem lines on last close), and the PPK2 firmware treats the
+        // DTR drop as a host disconnect and resets — cutting power to the
+        // device under test. Clearing HUPCL lets state set by `power on`
+        // survive process exit. It must be cleared on the port's own file
+        // descriptor: the port is opened in exclusive mode (TIOCEXCL), so
+        // opening a second descriptor would fail with EBUSY. (Not
+        // implemented on Windows.)
+        #[cfg(unix)]
+        let mut port: Box<dyn SerialPort> = {
+            use std::os::fd::AsRawFd;
+            let native = builder.open_native()?;
+            clear_hupcl(native.as_raw_fd())?;
+            Box::new(native)
+        };
+        #[cfg(not(unix))]
+        let mut port: Box<dyn SerialPort> = builder.open()?;
+
         port.clear(ClearBuffer::All).ok();
         // Required for the device to talk to us on Windows.
         port.write_data_terminal_ready(true).ok();
@@ -80,8 +98,13 @@ impl Device {
         &self.metadata
     }
 
-    /// Set the source voltage in millivolt.
+    /// Set the source voltage in millivolt (800..=5000).
     pub fn set_source_voltage(&mut self, mv: u16) -> Result<()> {
+        if !(800..=5000).contains(&mv) {
+            return Err(Error::InvalidConfig(format!(
+                "voltage must be in 800..=5000 mV, got {mv}"
+            )));
+        }
         self.send(Command::RegulatorSet(SourceVoltage::from_millivolts(mv)))
     }
 
@@ -165,6 +188,23 @@ impl Device {
         }
         Ok(Metadata::from_bytes(&response)?)
     }
+}
+
+/// Clear the HUPCL termios flag on an open tty file descriptor, so the
+/// kernel leaves DTR asserted when the port is closed.
+#[cfg(unix)]
+fn clear_hupcl(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(fd, &mut t) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        t.c_cflag &= !libc::HUPCL;
+        if libc::tcsetattr(fd, libc::TCSANOW, &t) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 impl Drop for Device {

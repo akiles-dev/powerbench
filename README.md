@@ -20,9 +20,12 @@ Built on the [ppk2](https://crates.io/crates/ppk2) crate.
 - **Compare**: statistically sound comparison of two sample files with a
   p-value, a bootstrap confidence interval for the difference, and an exit-code
   gate for CI.
-- **Plot**: render one or two recordings to PNG/SVG with gnuplot (headless,
-  no display needed): a min/mean/max envelope over time plus a percentile
-  (CDF) view of the sample distribution.
+- **Plot**: render one or two recordings with gnuplot — to PNG/SVG (headless,
+  no display needed) or to an interactive window when no output file is
+  given: a min/mean/max envelope over time plus a percentile (CDF) view of
+  the sample distribution. The current axis switches to log automatically
+  when the data spans a wide dynamic range, so the sleep floor stays
+  readable next to wake spikes (`--linear`/`--log` to override).
 
 ## Installation
 
@@ -68,6 +71,15 @@ Welch's t-test:    t = 193.892, dof = 57.9, p = 0.00e0
 percentile         baseline            new           diff
 p1                 50.10 µA       54.11 µA        4.01 µA
 ...
+```
+
+### Powering a device without measuring
+
+Useful for flashing or manual testing with the PPK2 as the power source:
+
+```sh
+powerbench power on --voltage 3000   # stays on after the command exits
+powerbench power off
 ```
 
 ### Statistics of a single file

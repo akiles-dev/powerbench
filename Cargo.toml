@@ -1,0 +1,36 @@
+[package]
+name = "powerbench"
+version = "0.1.0"
+edition = "2021"
+description = "Structured low-power benchmarking with the Nordic Power Profiler Kit II (PPK2)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/lulf/powerbench"
+readme = "README.md"
+keywords = ["ppk2", "power", "benchmark", "embedded", "nordic"]
+categories = ["embedded", "development-tools::profiling", "command-line-utilities"]
+
+[dependencies]
+ppk2 = "0.1.3"
+serialport = "4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+statrs = "0.18"
+
+# CLI-only dependencies, not pulled in when using powerbench as a library
+# with `default-features = false`.
+clap = { version = "4", features = ["derive"], optional = true }
+ctrlc = { version = "3", features = ["termination"], optional = true }
+anyhow = { version = "1", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:ctrlc", "dep:anyhow", "dep:libc"]
+
+[[bin]]
+name = "powerbench"
+path = "src/main.rs"
+required-features = ["cli"]

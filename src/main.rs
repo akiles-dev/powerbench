@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
-use powerbench::acquire::{record, Progress, RecordConfig};
+use powerbench::acquire::{live, record, LiveConfig, LiveSummary, Progress, RecordConfig};
 use powerbench::compare::{compare, CompareConfig, CompareResult};
 use powerbench::device::Device;
 use powerbench::format::Recording;
@@ -64,6 +64,42 @@ enum Cmd {
         #[arg(short, long)]
         label: Option<String>,
         /// Print the resulting statistics as JSON on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Monitor current draw live, showing a moving average over the last
+    /// N seconds. Runs until interrupted (Ctrl-C), then prints a summary.
+    Live {
+        /// Source voltage in millivolt (800..=5000).
+        #[arg(short, long)]
+        voltage: u16,
+        /// Moving-average window in seconds.
+        #[arg(short, long, default_value_t = 10.0)]
+        window: f64,
+        /// Samples per second underlying the window (must divide 100000).
+        /// The window's min/max are taken over these samples, so a higher
+        /// rate resolves shorter spikes.
+        #[arg(short, long, default_value_t = 1000)]
+        sps: u32,
+        /// Seconds between display updates.
+        #[arg(short, long, default_value_t = 0.5)]
+        interval: f64,
+        /// Serial port of the PPK2; autodetected when omitted.
+        #[arg(short, long)]
+        port: Option<String>,
+        /// Measurement mode.
+        #[arg(short, long, value_enum, default_value_t = Mode::Source)]
+        mode: Mode,
+        /// Keep the device powered after monitoring stops.
+        #[arg(long)]
+        keep_power: bool,
+        /// Print one line per update instead of rewriting a single status
+        /// line, so earlier readings stay visible as a scrolling log. This
+        /// is already the behavior when stdout is not a terminal.
+        #[arg(long)]
+        log: bool,
+        /// Print one JSON object per update on stdout (JSON Lines) instead
+        /// of the live status line.
         #[arg(long)]
         json: bool,
     },
@@ -214,20 +250,7 @@ fn run() -> anyhow::Result<ExitCode> {
                 label,
             };
 
-            // With the "termination" feature this handler catches SIGINT,
-            // SIGTERM and SIGHUP. The first signal requests a graceful stop
-            // (the recording loop notices within ~500 ms, stops sampling and
-            // powers the DUT off); a second one force-exits.
-            let cancel = Arc::new(AtomicBool::new(false));
-            let c = cancel.clone();
-            ctrlc::set_handler(move || {
-                if c.swap(true, Ordering::Relaxed) {
-                    eprintln!("\nforced exit");
-                    std::process::exit(130);
-                }
-                eprintln!("\ninterrupted, shutting down...");
-            })
-            .context("installing signal handler")?;
+            let cancel = install_cancel_handler()?;
 
             eprintln!(
                 "powering device at {voltage} mV, settling {settle} s, sampling {duration} s at {sps} sps"
@@ -255,6 +278,65 @@ fn run() -> anyhow::Result<ExitCode> {
                 print_stats_json(&output, &recording, &stats)?;
             } else {
                 print_stats(&output, &recording, &stats);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+
+        Cmd::Live {
+            voltage,
+            window,
+            sps,
+            interval,
+            port,
+            mode,
+            keep_power,
+            log,
+            json,
+        } => {
+            let config = LiveConfig {
+                port,
+                voltage_mv: voltage,
+                mode: match mode {
+                    Mode::Source => MeasurementMode::Source,
+                    Mode::Ampere => MeasurementMode::Ampere,
+                },
+                sps,
+                window: Duration::from_secs_f64(window),
+                update_interval: Duration::from_secs_f64(interval),
+                keep_power,
+            };
+            let cancel = install_cancel_handler()?;
+
+            eprintln!(
+                "powering device at {voltage} mV, monitoring at {sps} sps with a {window} s \
+                 window; Ctrl-C to stop"
+            );
+            let interactive = !log && std::io::stdout().is_terminal();
+            let summary = live(&config, Some(&cancel), |u| {
+                if json {
+                    // Fields are finite floats and integers; this cannot fail.
+                    let line = serde_json::to_string(u).expect("serializing update");
+                    println!("{line}");
+                } else if interactive {
+                    // Truncate to the terminal width: a wrapped line breaks
+                    // the carriage-return rewrite.
+                    let mut line = live_line(u);
+                    if let Some(width) = terminal_width() {
+                        line = line.chars().take(width).collect();
+                    }
+                    print!("\r\x1b[K{line}");
+                    std::io::stdout().flush().ok();
+                } else {
+                    println!("{}", live_line(u));
+                }
+            })?;
+            if interactive && !json {
+                println!();
+            }
+            if json {
+                println!("{}", serde_json::to_string(&summary)?);
+            } else {
+                print_live_summary(&summary);
             }
             Ok(ExitCode::SUCCESS)
         }
@@ -378,6 +460,25 @@ fn run() -> anyhow::Result<ExitCode> {
     }
 }
 
+/// Install a signal handler that requests a graceful stop via the returned
+/// flag. With the "termination" feature this catches SIGINT, SIGTERM and
+/// SIGHUP. The first signal sets the flag (the sampling loop notices within
+/// ~500 ms, stops the stream and powers the DUT off); a second one
+/// force-exits.
+fn install_cancel_handler() -> anyhow::Result<Arc<AtomicBool>> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let c = cancel.clone();
+    ctrlc::set_handler(move || {
+        if c.swap(true, Ordering::Relaxed) {
+            eprintln!("\nforced exit");
+            std::process::exit(130);
+        }
+        eprintln!("\ninterrupted, shutting down...");
+    })
+    .context("installing signal handler")?;
+    Ok(cancel)
+}
+
 fn print_progress(p: Progress) {
     let interactive = std::io::stderr().is_terminal();
     let line = match p {
@@ -417,6 +518,65 @@ fn fmt_ua(ua: f64) -> String {
     } else {
         format!("{:.1} nA", ua * 1000.0)
     }
+}
+
+fn live_line(u: &powerbench::LiveUpdate) -> String {
+    format!(
+        "{:7.1}s now {:>10} avg({:.0}s) {:>10} min {:>10} p50 {:>10} p95 {:>10} \
+         p99 {:>10} max {:>10} tot {:>10}",
+        u.elapsed_secs,
+        fmt_ua(u.now_ua),
+        u.window_secs,
+        fmt_ua(u.window_mean_ua),
+        fmt_ua(u.window_min_ua),
+        fmt_ua(u.window_p50_ua),
+        fmt_ua(u.window_p95_ua),
+        fmt_ua(u.window_p99_ua),
+        fmt_ua(u.window_max_ua),
+        fmt_ua(u.total_mean_ua),
+    )
+}
+
+/// Width of the terminal on stdout, if it can be determined.
+#[cfg(unix)]
+fn terminal_width() -> Option<usize> {
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+            Some(ws.ws_col as usize)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn terminal_width() -> Option<usize> {
+    None
+}
+
+fn print_live_summary(s: &LiveSummary) {
+    println!("session summary");
+    println!(
+        "  duration: {:.1} s ({} samples){}",
+        s.duration_secs,
+        s.samples,
+        if s.missed_samples > 0 {
+            format!(", {} raw samples missed", s.missed_samples)
+        } else {
+            String::new()
+        }
+    );
+    println!(
+        "  mean:     {:>12}   min:  {:>12}   max: {:>12}",
+        fmt_ua(s.mean_ua),
+        fmt_ua(s.min_ua),
+        fmt_ua(s.max_ua)
+    );
+    println!(
+        "  charge:   {:.4} µAh   avg power: {:.2} µW",
+        s.charge_uah, s.avg_power_uw
+    );
 }
 
 fn print_stats(file: &std::path::Path, rec: &Recording, s: &Stats) {
@@ -528,5 +688,35 @@ fn print_compare(baseline: &std::path::Path, new: &std::path::Path, r: &CompareR
             fmt_ua(p.new),
             fmt_ua(p.new - p.baseline)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_line_is_compact() {
+        let u = powerbench::LiveUpdate {
+            elapsed_secs: 1234.5,
+            now_ua: 152.1,
+            window_secs: 10.0,
+            window_mean_ua: 148.73,
+            window_min_ua: 0.0482,
+            window_p50_ua: 51.2,
+            window_p95_ua: 1200.0,
+            window_p99_ua: 2100.0,
+            window_max_ua: 2_500_000.0,
+            total_mean_ua: 151.02,
+            total_charge_uah: 0.5,
+            missed_samples: 0,
+        };
+        let line = live_line(&u);
+        for label in ["now", "avg(10s)", "min", "p50", "p95", "p99", "max", "tot"] {
+            assert!(line.contains(label), "missing {label} in {line}");
+        }
+        // Fits in a typically-sized terminal so the in-place rewrite does
+        // not have to truncate.
+        assert!(line.chars().count() <= 140, "line too wide: {line}");
     }
 }

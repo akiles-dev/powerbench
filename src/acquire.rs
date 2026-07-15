@@ -71,6 +71,29 @@ pub enum Progress {
     },
 }
 
+fn validate_sps(sps: u32) -> Result<()> {
+    if sps == 0 || sps > PPK2_RAW_SPS {
+        return Err(Error::InvalidConfig(format!(
+            "sps must be in 1..={PPK2_RAW_SPS}, got {sps}"
+        )));
+    }
+    if !PPK2_RAW_SPS.is_multiple_of(sps) {
+        return Err(Error::InvalidConfig(format!(
+            "sps must divide {PPK2_RAW_SPS} evenly (e.g. 10, 100, 1000, 10000, 100000), got {sps}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_voltage(voltage_mv: u16) -> Result<()> {
+    if !(800..=5000).contains(&voltage_mv) {
+        return Err(Error::InvalidConfig(format!(
+            "voltage must be in 800..=5000 mV, got {voltage_mv}"
+        )));
+    }
+    Ok(())
+}
+
 /// Record samples from a PPK2 according to `config`.
 ///
 /// Timing: the settle period is measured from the moment power is enabled,
@@ -89,24 +112,8 @@ pub fn record(
     cancel: Option<&AtomicBool>,
     mut progress: impl FnMut(Progress),
 ) -> Result<Recording> {
-    if config.sps == 0 || config.sps > PPK2_RAW_SPS {
-        return Err(Error::InvalidConfig(format!(
-            "sps must be in 1..={PPK2_RAW_SPS}, got {}",
-            config.sps
-        )));
-    }
-    if !PPK2_RAW_SPS.is_multiple_of(config.sps) {
-        return Err(Error::InvalidConfig(format!(
-            "sps must divide {PPK2_RAW_SPS} evenly (e.g. 10, 100, 1000, 10000, 100000), got {}",
-            config.sps
-        )));
-    }
-    if !(800..=5000).contains(&config.voltage_mv) {
-        return Err(Error::InvalidConfig(format!(
-            "voltage must be in 800..=5000 mV, got {}",
-            config.voltage_mv
-        )));
-    }
+    validate_sps(config.sps)?;
+    validate_voltage(config.voltage_mv)?;
     let is_cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
 
     let mut dev = Device::open(config.port.as_deref(), config.mode)?;
@@ -235,6 +242,245 @@ pub fn record(
             missed_samples,
         },
         samples_ua,
+    })
+}
+
+/// Configuration for live monitoring ([`live`]).
+#[derive(Debug, Clone)]
+pub struct LiveConfig {
+    /// Serial port of the PPK2. Autodetected when `None`.
+    pub port: Option<String>,
+    /// Source voltage in millivolt (800..=5000).
+    pub voltage_mv: u16,
+    /// Measurement mode. In `Source` mode the PPK2 powers the device under
+    /// test; in `Ampere` mode it acts as an ammeter in series.
+    pub mode: MeasurementMode,
+    /// Samples per second underlying the window (1..=100_000). Each sample is
+    /// the average of `100_000 / sps` raw ADC samples; the window's min/max
+    /// are taken over these samples, so a higher sps resolves shorter spikes.
+    pub sps: u32,
+    /// Length of the moving-average window.
+    pub window: Duration,
+    /// How often the update callback is invoked.
+    pub update_interval: Duration,
+    /// Keep the device powered after monitoring stops.
+    pub keep_power: bool,
+}
+
+impl Default for LiveConfig {
+    fn default() -> Self {
+        Self {
+            port: None,
+            voltage_mv: 3000,
+            mode: MeasurementMode::Source,
+            sps: 1000,
+            window: Duration::from_secs(10),
+            update_interval: Duration::from_millis(500),
+            keep_power: false,
+        }
+    }
+}
+
+/// A periodic snapshot delivered to the callback passed to [`live`].
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct LiveUpdate {
+    /// Seconds since sampling started.
+    pub elapsed_secs: f64,
+    /// Mean current in µA over the samples since the previous update.
+    pub now_ua: f64,
+    /// Seconds of data currently in the window (less than the configured
+    /// window length until it has filled once).
+    pub window_secs: f64,
+    /// Moving average in µA over the window.
+    pub window_mean_ua: f64,
+    /// Minimum sample in µA in the window.
+    pub window_min_ua: f64,
+    /// Maximum sample in µA in the window.
+    pub window_max_ua: f64,
+    /// Median (50th percentile) sample in µA in the window.
+    pub window_p50_ua: f64,
+    /// 95th percentile sample in µA in the window.
+    pub window_p95_ua: f64,
+    /// 99th percentile sample in µA in the window.
+    pub window_p99_ua: f64,
+    /// Mean current in µA since sampling started.
+    pub total_mean_ua: f64,
+    /// Charge in µAh consumed since sampling started.
+    pub total_charge_uah: f64,
+    /// Raw samples the stream's counter field reported as missed so far.
+    pub missed_samples: u64,
+}
+
+/// Summary of a whole [`live`] monitoring session.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct LiveSummary {
+    /// Seconds of data monitored.
+    pub duration_secs: f64,
+    /// Number of samples (at the configured sps).
+    pub samples: u64,
+    /// Mean current in µA over the whole session.
+    pub mean_ua: f64,
+    /// Minimum sample in µA over the whole session.
+    pub min_ua: f64,
+    /// Maximum sample in µA over the whole session.
+    pub max_ua: f64,
+    /// Charge in µAh consumed over the whole session.
+    pub charge_uah: f64,
+    /// Average power in µW over the whole session (at the source voltage).
+    pub avg_power_uw: f64,
+    /// Raw samples the stream's counter field reported as missed.
+    pub missed_samples: u64,
+}
+
+/// Monitor current draw live, maintaining a moving average over the most
+/// recent `config.window` of samples.
+///
+/// Powers the device, samples indefinitely, and invokes `on_update` every
+/// `config.update_interval` with the window statistics. Runs until `cancel`
+/// becomes `true` — unlike [`record`], cancellation is the normal way to end
+/// a live session and is not an error. On return the stream is stopped and
+/// power is turned off (unless `keep_power`), and statistics over the whole
+/// session are returned.
+pub fn live(
+    config: &LiveConfig,
+    cancel: Option<&AtomicBool>,
+    mut on_update: impl FnMut(&LiveUpdate),
+) -> Result<LiveSummary> {
+    validate_sps(config.sps)?;
+    validate_voltage(config.voltage_mv)?;
+    let window_len = (config.window.as_secs_f64() * config.sps as f64).round() as usize;
+    if window_len == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "window of {} s holds no samples at {} sps",
+            config.window.as_secs_f64(),
+            config.sps
+        )));
+    }
+    let is_cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+
+    let mut dev = Device::open(config.port.as_deref(), config.mode)?;
+    dev.keep_power_on_drop(config.keep_power);
+    dev.set_source_voltage(config.voltage_mv)?;
+    dev.set_device_power(true)?;
+
+    let chunk = (PPK2_RAW_SPS / config.sps) as usize;
+    let mut window: VecDeque<f32> = VecDeque::with_capacity(window_len);
+    // Scratch buffer the window is sorted into for percentiles, reused
+    // across updates.
+    let mut sorted: Vec<f32> = Vec::with_capacity(window_len);
+    let mut pending: VecDeque<Measurement> = VecDeque::with_capacity(chunk + 4096);
+    let mut accumulator = MeasurementAccumulator::new(dev.metadata().clone());
+    let mut missed_samples: u64 = 0;
+
+    // Whole-session aggregates; the window only holds the recent past.
+    let mut total_count: u64 = 0;
+    let mut total_sum: f64 = 0.0;
+    let mut total_min = f64::INFINITY;
+    let mut total_max = f64::NEG_INFINITY;
+    // Aggregates since the last update, for the "now" reading.
+    let mut since_count: u64 = 0;
+    let mut since_sum: f64 = 0.0;
+
+    dev.start_sampling()?;
+
+    let start = Instant::now();
+    let mut last_update = Instant::now();
+    let mut last_data = Instant::now();
+    let mut buf = [0u8; 4096];
+    let mut raw_bytes: u64 = 0;
+    let mut rate_checked = false;
+    let result = loop {
+        if is_cancelled() {
+            break Ok(());
+        }
+        // The raw stream is nominally 400 KB/s regardless of the requested
+        // sps. Bail out early with a diagnosis if it is far below that.
+        let elapsed = start.elapsed();
+        if !rate_checked && elapsed >= Duration::from_secs(2) {
+            rate_checked = true;
+            let rate = raw_bytes / elapsed.as_secs().max(1);
+            if rate < 4 * PPK2_RAW_SPS as u64 * 9 / 10 {
+                break Err(Error::StreamRate {
+                    bytes_per_sec: rate,
+                });
+            }
+        }
+        if last_data.elapsed() > Duration::from_secs(3) {
+            break Err(Error::Device(
+                "measurement stream stalled: no data for 3 s".into(),
+            ));
+        }
+        match dev.read_stream(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => {
+                last_data = Instant::now();
+                raw_bytes += n as u64;
+                missed_samples += accumulator.feed_into(&buf[..n], &mut pending) as u64;
+                while pending.len() >= chunk {
+                    let sum: f64 = pending.drain(..chunk).map(|m| m.micro_amps as f64).sum();
+                    let sample = (sum / chunk as f64) as f32;
+                    if window.len() == window_len {
+                        window.pop_front();
+                    }
+                    window.push_back(sample);
+                    total_count += 1;
+                    total_sum += sample as f64;
+                    total_min = total_min.min(sample as f64);
+                    total_max = total_max.max(sample as f64);
+                    since_count += 1;
+                    since_sum += sample as f64;
+                }
+            }
+            Err(e) => break Err(e),
+        }
+        if since_count > 0 && last_update.elapsed() >= config.update_interval {
+            last_update = Instant::now();
+            sorted.clear();
+            sorted.extend(window.iter().copied());
+            sorted.sort_unstable_by(|a, b| a.total_cmp(b));
+            let sum: f64 = sorted.iter().map(|&s| s as f64).sum();
+            on_update(&LiveUpdate {
+                elapsed_secs: start.elapsed().as_secs_f64(),
+                now_ua: since_sum / since_count as f64,
+                window_secs: window.len() as f64 / config.sps as f64,
+                window_mean_ua: sum / sorted.len() as f64,
+                window_min_ua: sorted[0] as f64,
+                window_max_ua: sorted[sorted.len() - 1] as f64,
+                window_p50_ua: crate::stats::percentile_sorted(&sorted, 50.0),
+                window_p95_ua: crate::stats::percentile_sorted(&sorted, 95.0),
+                window_p99_ua: crate::stats::percentile_sorted(&sorted, 99.0),
+                total_mean_ua: total_sum / total_count as f64,
+                total_charge_uah: total_sum / config.sps as f64 / 3600.0,
+                missed_samples,
+            });
+            since_count = 0;
+            since_sum = 0.0;
+        }
+    };
+
+    dev.stop_sampling().ok();
+    if !config.keep_power {
+        dev.set_device_power(false)?;
+    }
+    result?;
+
+    Ok(LiveSummary {
+        duration_secs: total_count as f64 / config.sps as f64,
+        samples: total_count,
+        mean_ua: if total_count > 0 {
+            total_sum / total_count as f64
+        } else {
+            0.0
+        },
+        min_ua: if total_count > 0 { total_min } else { 0.0 },
+        max_ua: if total_count > 0 { total_max } else { 0.0 },
+        charge_uah: total_sum / config.sps as f64 / 3600.0,
+        avg_power_uw: if total_count > 0 {
+            total_sum / total_count as f64 * config.voltage_mv as f64 / 1000.0
+        } else {
+            0.0
+        },
+        missed_samples,
     })
 }
 

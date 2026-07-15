@@ -4,6 +4,8 @@
 //!
 //! - Recording current measurements from a PPK2 into a self-describing sample
 //!   file ([`acquire`], [`format`]).
+//! - Live monitoring with a moving average over the last N seconds
+//!   ([`acquire::live`]).
 //! - Computing summary statistics over a recording ([`stats`]).
 //! - Comparing two recordings and deciding whether the difference is
 //!   statistically significant ([`compare`]).
@@ -41,7 +43,7 @@ pub mod format;
 pub mod plot;
 pub mod stats;
 
-pub use acquire::{record, RecordConfig};
+pub use acquire::{live, record, LiveConfig, LiveSummary, LiveUpdate, RecordConfig};
 pub use compare::{compare, CompareConfig, CompareResult};
 pub use device::Device;
 pub use format::{Meta, Recording};

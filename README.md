@@ -15,6 +15,9 @@ Built on the [ppk2](https://crates.io/crates/ppk2) crate.
 - **Measure**: enable device power at a chosen voltage, wait for the device to
   settle, sample for a fixed duration, and store the result in a compact,
   self-describing sample file.
+- **Live**: monitor current draw interactively with a moving average over the
+  last N seconds — for poking at a device on the bench without recording
+  files.
 - **Stats**: min / max / mean / standard deviation / percentiles, total charge
   (µAh) and average power.
 - **Compare**: statistically sound comparison of two sample files with a
@@ -73,6 +76,34 @@ p1                 50.10 µA       54.11 µA        4.01 µA
 ...
 ```
 
+### Watching a device live
+
+For bench work — verifying that a device actually enters its sleep floor,
+watching the effect of pressing a button — `live` shows a continuously
+updated moving average without writing any files:
+
+```sh
+powerbench live --voltage 3000 --window 10
+```
+
+```
+   42.3s now  152.10 µA avg(10s)  148.73 µA min   48.20 µA p50   51.20 µA p95   1.200 mA p99   2.100 mA max   2.410 mA tot  151.02 µA
+```
+
+`now` is the mean since the previous display update, `avg` the moving average
+over the window (`--window`, default 10 s), and `min`/`p50`/`p95`/`p99`/`max`
+the distribution within the window at the underlying sample rate (`--sps`,
+default 1000 — raise it to resolve shorter spikes); `tot` is the mean since
+the start. The display updates every `--interval` seconds (default 0.5).
+Ctrl-C stops monitoring, powers the device off (unless `--keep-power`) and
+prints a whole-session summary.
+
+By default the status line updates in place; `--log` prints one line per
+update instead, so earlier readings stay visible as a scrolling log (this is
+also the behavior when stdout is not a terminal, so piping to `tee` gets a
+log stream too). `--json` emits one JSON object per update (JSON Lines) plus
+a final summary object, for feeding a dashboard or log.
+
 ### Powering a device without measuring
 
 Useful for flashing or manual testing with the PPK2 as the power source:
@@ -111,7 +142,8 @@ measurement stream is stopped and power to the device under test is turned
 off (unless `--keep-power` was given), returning the PPK2 to its initial
 state; the exit code is 130 and no sample file is written. A second signal
 force-exits. The same cleanup also runs if the recording fails with an
-error.
+error. For `live`, a signal is the normal way to stop: the same cleanup
+runs, the session summary is printed, and the exit code is 0.
 
 ### Trying it without hardware
 
